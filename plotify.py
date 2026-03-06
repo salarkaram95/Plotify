@@ -1,9 +1,10 @@
+import numpy as np
 import matplotlib.path as mpath
+import matplotlib.ticker as mticker
+from scipy.interpolate import interp1d
 import cartopy.crs as ccrs
 from cartopy.io.shapereader import Reader
 from cartopy.feature import ShapelyFeature
-import numpy as np
-import matplotlib.ticker as mticker
 from cartopy.mpl.ticker import LongitudeFormatter, LatitudeFormatter
 import xarray as xr
 import pickle  # for loading merged geometries
@@ -14,7 +15,6 @@ def setup_polar_base(ax, hemisphere='south',
                    shp_folder="cartopy_data/natural_earth/50m_physical/",
                    lon_lim=(-180, 180), 
                    lat_lim=(-90, -60),                 
-                   circular_boundary=True,
                    land_color='lightgrey',
                    ice_shelf_color='white',
                    bathy=False,
@@ -84,13 +84,12 @@ def setup_polar_base(ax, hemisphere='south',
         lat_lim = default_lat_lim
     ax.set_extent([*lon_lim, *lat_lim], crs=ccrs.PlateCarree())
 
-    # Circular boundary 
-    if circular_boundary:
-        theta = np.linspace(0, 2*np.pi, 200)
-        verts = np.vstack([np.sin(theta), np.cos(theta)]).T
-        circle = mpath.Path(0.5 * verts + [0.5, 0.5])
-        ax.set_boundary(circle, transform=ax.transAxes)
-        ax.set_aspect("equal", adjustable="box")
+    # Circular boundary (always applied)
+    theta = np.linspace(0, 2*np.pi, 200)
+    verts = np.vstack([np.sin(theta), np.cos(theta)]).T
+    circle = mpath.Path(0.5 * verts + [0.5, 0.5])
+    ax.set_boundary(circle, transform=ax.transAxes)
+    ax.set_aspect("equal", adjustable="box")
 
 
     # Optional bathymetry
@@ -98,9 +97,9 @@ def setup_polar_base(ax, hemisphere='south',
     if bathy:
         try:
             bathy_files = {
-                "coarse": "gebco_antarctic_coarse.nc",
-                "medium": "gebco_antarctic_medium.nc",
-                "high": "gebco_antarctic_high.nc",
+                "coarse": "gebco_coarse.nc",
+                "medium": "gebco_medium.nc",
+                "high": "gebco_high.nc",
             }
             if bathy_resolution not in bathy_files:
                 raise ValueError("Input 'bathy_resolution' must be 'coarse', 'medium', or 'high'")
@@ -130,18 +129,7 @@ def setup_polar_base(ax, hemisphere='south',
 
             mask = sv.contains(merged_land, lon_sub[None, :], lat_sub[:, None])
             mask |= sv.contains(merged_ice, lon_sub[None, :], lat_sub[:, None])
-            
-#            import shapely.vectorized as sv
-#            land_shapes = list(Reader(shp_folder + "ne_50m_land.shp").geometries())
-#            ice_shapes = list(Reader(shp_folder + "ne_50m_antarctic_ice_shelves_polys.shp").geometries())
-#            mask = np.zeros_like(bathy_sub, dtype=bool)
-#            # Mask land
-#            for geom in land_shapes:
-#                mask |= sv.contains(geom, lon_sub[None, :], lat_sub[:, None])
-#            # Mask ice shelves
-#            for geom in ice_shapes:
-#                mask |= sv.contains(geom, lon_sub[None, :], lat_sub[:, None])
-#            # Apply mask
+
             bathy_masked = np.where(mask, np.nan, bathy_sub)
     
             # Plot masked bathymetry
@@ -150,14 +138,13 @@ def setup_polar_base(ax, hemisphere='south',
                 levels=bathy_levels,
                 colors=bathy_color,
                 linestyles='-',
-                linewidths=1,
+                linewidths=0.5,
                 transform=ccrs.PlateCarree(),
             )
     
         except Exception as e:
             print("Bathymetry not plotted:", e)
 
-    
     return ax
 
 
@@ -242,9 +229,244 @@ def setup_polar_grid(ax,
 
     return gl
 
+def setup_lambert_base(ax,
+                       lon_lim,
+                       lat_lim,
+                       shp_folder="cartopy_data/natural_earth/50m_physical/",
+                       land_color='lightgrey',
+                       ice_shelf_color='white',
+                       bathy=False,
+                       bathy_resolution="coarse",
+                       bathy_levels=[-5000, -4000, -3000, -2000, -1000, -500],
+                       bathy_color='black'):
+    """
+    Lambert Conformal Conic axis clipped to lon/lat limits with curved top,
+    with land/ice and optional bathymetry masked correctly.
+    """
 
+    # --- Projection parameters ---
+    central_lon = (lon_lim[0] + lon_lim[1]) / 2
+    central_lat = (lat_lim[0] + lat_lim[1]) / 2
+    standard_parallels = (lat_lim[0], lat_lim[1])
+    lambert_proj = ccrs.LambertConformal(
+        central_longitude=central_lon,
+        central_latitude=central_lat,
+        standard_parallels=standard_parallels
+    )
+    ax.projection = lambert_proj
 
+    # --- Build boundary Path in PlateCarree coordinates (follows lon/lat limits) ---
+    npoints = 200
+    lon_vals = np.linspace(lon_lim[0], lon_lim[1], npoints)
+    lat_vals_top = np.full(npoints, lat_lim[1])
+    lat_vals_bottom = np.full(npoints, lat_lim[0])
 
+    # Clockwise around rectangle
+    boundary_lonlat = np.vstack([
+        np.column_stack((lon_vals, lat_vals_bottom)),   # bottom
+        np.column_stack((lon_vals[::-1], lat_vals_top[::-1]))  # top
+    ])
+    boundary_xy = lambert_proj.transform_points(ccrs.PlateCarree(),
+                                                boundary_lonlat[:,0],
+                                                boundary_lonlat[:,1])[:,:2]
+    boundary_path = mpath.Path(boundary_xy)
+    ax.set_boundary(boundary_path, transform=None)
+
+    # --- Land and ice features ---
+    land_geoms = list(Reader(shp_folder + "ne_50m_land.shp").geometries())
+    ice_geoms = list(Reader(shp_folder + "ne_50m_antarctic_ice_shelves_polys.shp").geometries())
+
+    land_shp = ShapelyFeature(land_geoms, ccrs.PlateCarree(), facecolor=land_color)
+    ice_shp = ShapelyFeature(ice_geoms, ccrs.PlateCarree(), facecolor=ice_shelf_color, edgecolor='none')
+
+    ax.add_feature(land_shp)
+    ax.add_feature(ice_shp)
+
+    # --- Optional bathymetry ---
+    if bathy:
+        try:
+            bathy_files = {
+                "coarse": "gebco_coarse.nc",
+                "medium": "gebco_medium.nc",
+                "high": "gebco_high.nc",
+            }
+            ds = xr.open_dataset(f"gebco_2025_sub_ice_topo/{bathy_files[bathy_resolution]}")
+            bathy_data = ds["elevation"].values
+            bathy_lon = ds["lon"].values
+            bathy_lat = ds["lat"].values
+
+            # Subset lon/lat
+            lon_mask = (bathy_lon >= lon_lim[0]) & (bathy_lon <= lon_lim[1])
+            lat_mask = (bathy_lat >= lat_lim[0]) & (bathy_lat <= lat_lim[1])
+            bathy_sub = bathy_data[np.ix_(lat_mask, lon_mask)]
+            lon_sub = bathy_lon[lon_mask]
+            lat_sub = bathy_lat[lat_mask]
+            lon_grid, lat_grid = np.meshgrid(lon_sub, lat_sub)
+
+            # Load merged land/ice for masking
+            with open(shp_folder + "merged_land.pkl", "rb") as f:
+                merged_land = pickle.load(f)
+            with open(shp_folder + "merged_ice.pkl", "rb") as f:
+                merged_ice = pickle.load(f)
+
+            # Mask points under land/ice
+            mask = sv.contains(merged_land, lon_grid, lat_grid)
+            mask |= sv.contains(merged_ice, lon_grid, lat_grid)
+
+            # Mask points outside boundary
+            # Transform grid points to Lambert coordinates
+            proj_points = lambert_proj.transform_points(ccrs.PlateCarree(), lon_grid, lat_grid)
+            x_proj, y_proj = proj_points[:,:,0], proj_points[:,:,1]
+            flat_mask = np.array([boundary_path.contains_point([x_proj[i,j], y_proj[i,j]])
+                                  for i in range(x_proj.shape[0])
+                                  for j in range(x_proj.shape[1])]).reshape(x_proj.shape)
+            mask |= ~flat_mask
+
+            bathy_masked = np.where(mask, np.nan, bathy_sub)
+
+            ax.contour(lon_grid, lat_grid, bathy_masked,
+                       levels=bathy_levels,
+                       colors=bathy_color,
+                       linestyles='-',
+                       linewidths=0.5,
+                       transform=ccrs.PlateCarree())
+        except Exception as e:
+            print("Bathymetry not plotted:", e)
+
+    return ax
+
+def setup_lambert_grid(ax, lon_ticks=None, lat_ticks=None,
+                       label_fontsize=14, grid_kwargs=None,
+                       lon_label_offset_fraction=0.03, lat_label_offset_fraction=0.01,
+                       show_labels=True):
+    """
+    Draw gridlines with longitude/latitude labels inside a Lambert map.
+
+    - Longitude labels appear on top
+    - Latitude labels appear on left, normal to the left edge
+    - Bottom and right labels are disabled
+    - Labels show degrees with E/W and N/S
+    - Labels can be toggled with show_labels
+    """
+
+    if grid_kwargs is None:
+        grid_kwargs = dict(linewidth=1, color='black', alpha=0.5, linestyle='--')
+
+    # -----------------------
+    # Gridlines (no automatic labels)
+    # -----------------------
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=False, **grid_kwargs)
+
+    # Set custom ticks
+    if lon_ticks is not None:
+        gl.xlocator = mticker.FixedLocator(lon_ticks)
+    if lat_ticks is not None:
+        gl.ylocator = mticker.FixedLocator(lat_ticks)
+
+    # -----------------------
+    # Formatter functions for E/W and N/S
+    # -----------------------
+    def deg_lon_formatter(x):
+        if x < 0:
+            return f"{abs(int(x))}°W"
+        elif x > 0:
+            return f"{int(x)}°E"
+        else:
+            return "0°"
+
+    def deg_lat_formatter(y):
+        if y < 0:
+            return f"{abs(int(y))}°S"
+        elif y > 0:
+            return f"{int(y)}°N"
+        else:
+            return "0°"
+
+    gl.xformatter = mticker.FuncFormatter(lambda x, pos=None: deg_lon_formatter(x))
+    gl.yformatter = mticker.FuncFormatter(lambda y, pos=None: deg_lat_formatter(y))
+
+    # Disable bottom/right labels
+    gl.bottom_labels = False
+    gl.right_labels = False
+
+    # Only draw labels if requested
+    if not show_labels:
+        gl.top_labels = False
+        gl.left_labels = False
+        return gl
+
+    # -----------------------
+    # Compute top longitude labels
+    # -----------------------
+    if lon_ticks is not None and lat_ticks is not None:
+        top_lat = lat_ticks[-1]
+        label_offset_lat = (lat_ticks[-1] - lat_ticks[0]) * lon_label_offset_fraction
+
+        # Sample top edge to estimate slope
+        npts = 200
+        lon_vals = np.linspace(lon_ticks[0], lon_ticks[-1], npts)
+        top_x, top_y = ax.projection.transform_points(
+            ccrs.PlateCarree(),
+            lon_vals,
+            np.full_like(lon_vals, top_lat)
+        )[:, :2].T
+
+        dx = np.diff(top_x)
+        dy = np.diff(top_y)
+        slopes = np.arctan2(dy, dx)
+        slopes = np.hstack([slopes[0], slopes])
+
+        for lon in lon_ticks:
+            idx = np.searchsorted(lon_vals, lon)
+            rot = np.degrees(slopes[idx])
+            ax.text(lon, top_lat + label_offset_lat, deg_lon_formatter(lon),
+                    transform=ccrs.PlateCarree(),
+                    ha='center', va='bottom',
+                    fontsize=label_fontsize,
+                    rotation=rot)
+
+    # -----------------------
+    # Compute left latitude labels
+    # -----------------------
+    if lon_ticks is not None and lat_ticks is not None:
+        left_lon = lon_ticks[0]
+
+        # Sample points along left edge
+        npts = 200
+        lat_vals = np.linspace(lat_ticks[0], lat_ticks[-1], npts)
+        left_x, left_y = ax.projection.transform_points(
+            ccrs.PlateCarree(),
+            np.full_like(lat_vals, left_lon),
+            lat_vals
+        )[:, :2].T
+
+        dx = np.diff(left_x)
+        dy = np.diff(left_y)
+        slopes = np.arctan2(dy, dx)
+        slopes = np.hstack([slopes[0], slopes])
+
+        # Offset in projected meters
+        proj_width = ax.projection.x_limits[1] - ax.projection.x_limits[0]
+        offset_distance = proj_width * lat_label_offset_fraction
+        x_offset = -offset_distance * np.sin(slopes)
+        y_offset = offset_distance * np.cos(slopes)
+
+        # Interpolate offsets
+        x_func = interp1d(lat_vals, left_x + x_offset)
+        y_func = interp1d(lat_vals, left_y + y_offset)
+
+        for lat in lat_ticks:
+            x_label = x_func(lat)
+            y_label = y_func(lat)
+            idx = np.searchsorted(lat_vals, lat)
+            rot = np.degrees(slopes[idx]) - 90
+            ax.text(x_label, y_label, deg_lat_formatter(lat),
+                    transform=ax.projection,
+                    ha='right', va='center',
+                    fontsize=label_fontsize,
+                    rotation=rot)
+
+    return gl
 
 
 
